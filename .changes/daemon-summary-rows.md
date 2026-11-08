@@ -1,0 +1,1 @@
+- Paged session transcripts now include branch summaries and the retained-message count on compaction summaries.

@@ -219,17 +219,14 @@ fn reference_page(store: &SessionFile, page: &TranscriptPage) -> Option<PageView
         }
     };
     rows.truncate(end);
-    let mut page_rows = rows.split_off(start);
-    let first_entry_id = page_rows.first().map(|(id, _)| (*id).to_string());
-    let last_entry_id = page_rows.last().map(|(id, _)| (*id).to_string());
-    store.move_compaction_summary(&mut page_rows);
+    let page_rows = rows.split_off(start);
     Some((
         page_rows
             .iter()
             .map(|(_, message)| message.clone().into_owned())
             .collect(),
-        first_entry_id,
-        last_entry_id,
+        page_rows.first().map(|(id, _)| (*id).to_string()),
+        page_rows.last().map(|(id, _)| (*id).to_string()),
         more,
     ))
 }
@@ -615,7 +612,7 @@ fn a_windowed_store_counts_its_prefix_and_reads_its_window() {
 }
 
 #[test]
-fn a_paged_compaction_summary_precedes_its_retained_window() {
+fn a_paged_compaction_summary_carries_its_retained_count() {
     let mut store = SessionFile::create("/tmp", None, 0);
     store.append_message(&user("before the cut"));
     let retained = store.append_message(&user("retained"));
@@ -643,8 +640,8 @@ fn a_paged_compaction_summary_precedes_its_retained_window() {
         .position(|message| message_text(message) == "retained")
         .unwrap();
     assert!(
-        summary_index < retained_index,
-        "the summary must precede its retained window"
+        summary_index > retained_index,
+        "the compaction marker follows the retained window"
     );
     assert_eq!(
         page.messages[summary_index]["retainedMessageCount"],
@@ -670,8 +667,8 @@ fn a_paged_compaction_summary_precedes_its_retained_window() {
         .position(|message| message_text(message) == "retained")
         .unwrap();
     assert!(
-        summary_index < retained_index,
-        "start pages keep the same summary order"
+        summary_index > retained_index,
+        "start pages keep the compaction marker in history order"
     );
 }
 

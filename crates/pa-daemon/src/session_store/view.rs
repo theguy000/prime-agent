@@ -415,24 +415,10 @@ impl SessionFile {
             .get("firstKeptEntryId")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // Counting pass: the summary message carries the retained count, so the kept
-        // prefix is counted before anything is visited (the bearing check borrows only).
-        let mut keeping = false;
-        let mut retained_count = 0usize;
-        for entry in &branch[..compaction_position] {
-            // The durable cut can name bookkeeping, not just a message row.
-            if !keeping && entry.id == first_kept_entry_id {
-                keeping = true;
-            }
-            if !entry_bears_message(entry) {
-                continue;
-            }
-            if keeping {
-                retained_count += 1;
-            }
-        }
-        let summary =
-            std::borrow::Cow::Owned(compaction_summary_message(compaction, Some(retained_count)));
+        let summary = std::borrow::Cow::Owned(compaction_summary_message(
+            compaction,
+            Some(self.retained_message_count(compaction_position)),
+        ));
         if !visit(summary) {
             return;
         }
@@ -505,7 +491,7 @@ impl SessionFile {
     /// The page walks from its anchor, so its cost follows the page, not the session.
     #[must_use]
     pub fn transcript_page(&self, page: &TranscriptPage) -> Option<TranscriptPageRows> {
-        let (mut rows, more) = match page {
+        let (rows, more) = match page {
             TranscriptPage::End { before, limit } => self.end_page(before.as_deref(), *limit)?,
             TranscriptPage::Start {
                 after,
@@ -513,58 +499,15 @@ impl SessionFile {
                 limit,
             } => self.start_page(after.as_deref(), until.as_deref(), *limit)?,
         };
-        // The summary is not a page cursor: the original first row keeps an older request
-        // from fetching the retained window again.
-        let first_entry_id = rows.first().map(|(id, _)| (*id).to_string());
-        let last_entry_id = rows.last().map(|(id, _)| (*id).to_string());
-        self.move_compaction_summary(&mut rows);
         Some(TranscriptPageRows {
-            first_entry_id,
-            last_entry_id,
+            first_entry_id: rows.first().map(|(id, _)| (*id).to_string()),
+            last_entry_id: rows.last().map(|(id, _)| (*id).to_string()),
             messages: rows
                 .into_iter()
                 .map(|(_, message)| message.into_owned())
                 .collect(),
             more,
         })
-    }
-
-    /// Put a compaction summary before the retained window it describes.
-    ///
-    /// The compaction entry sits after its retained rows in the file. The page keeps its
-    /// original row ids, so the summary can move without changing the paging cursor.
-    fn move_compaction_summary(&self, rows: &mut Vec<DisplayRow<'_>>) {
-        let Some(summary_index) = rows
-            .iter()
-            .position(|(_, message)| message_role(message) == Some("compactionSummary"))
-        else {
-            return;
-        };
-        let summary_id = rows[summary_index].0;
-        let Some(compaction) = self.entry(summary_id) else {
-            return;
-        };
-        let first_kept = compaction
-            .fields
-            .get("firstKeptEntryId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(cut_position) = self.by_id.get(first_kept).copied() else {
-            return;
-        };
-        let Some(target) = rows.iter().enumerate().find_map(|(index, (id, _))| {
-            if index == summary_index {
-                return None;
-            }
-            let position = *self.by_id.get(*id)?;
-            (position >= cut_position).then_some(index)
-        }) else {
-            return;
-        };
-        if target < summary_index {
-            let summary = rows.remove(summary_index);
-            rows.insert(target, summary);
-        }
     }
 
     /// The newest `limit` rows before the `before` row (the tail without it).
@@ -1037,8 +980,8 @@ fn entry_bears_message(entry: &SessionEntry) -> bool {
     }
 }
 
-/// The `compactionSummary` message of a compaction entry; the context walk's
-/// copy carries its retained count.
+/// The `compactionSummary` message of a compaction entry; the context walk and
+/// the paged display both carry its retained count.
 fn compaction_summary_message(entry: &SessionEntry, retained_count: Option<usize>) -> Value {
     let timestamp = crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0);
     // The TS `compactionSummary` key order: role, summary, tokensBefore,
