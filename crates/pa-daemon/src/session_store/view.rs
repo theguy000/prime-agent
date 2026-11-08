@@ -415,24 +415,10 @@ impl SessionFile {
             .get("firstKeptEntryId")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // Counting pass: the summary message carries the retained count, so the kept
-        // prefix is counted before anything is visited (the bearing check borrows only).
-        let mut keeping = false;
-        let mut retained_count = 0usize;
-        for entry in &branch[..compaction_position] {
-            // The durable cut can name bookkeeping, not just a message row.
-            if !keeping && entry.id == first_kept_entry_id {
-                keeping = true;
-            }
-            if !entry_bears_message(entry) {
-                continue;
-            }
-            if keeping {
-                retained_count += 1;
-            }
-        }
-        let summary =
-            std::borrow::Cow::Owned(compaction_summary_message(compaction, Some(retained_count)));
+        let summary = std::borrow::Cow::Owned(compaction_summary_message(
+            compaction,
+            Some(self.retained_message_count(self.by_id[compaction.id.as_str()])),
+        ));
         if !visit(summary) {
             return;
         }
@@ -464,11 +450,33 @@ impl SessionFile {
     fn display_row(&self, position: usize) -> Option<DisplayRow<'_>> {
         let entry = &self.entries[position];
         let message = if entry.type_ == "compaction" {
-            std::borrow::Cow::Owned(compaction_summary_message(entry, None))
+            std::borrow::Cow::Owned(compaction_summary_message(
+                entry,
+                Some(self.retained_message_count(position)),
+            ))
         } else {
             entry_message(entry)?
         };
         Some((entry.id.as_str(), message))
+    }
+
+    /// Message-bearing rows from a compaction's `firstKeptEntryId` through its parent.
+    fn retained_message_count(&self, compaction_position: usize) -> usize {
+        let compaction = &self.entries[compaction_position];
+        let first_kept = compaction
+            .fields
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut count = 0usize;
+        for position in self.walk_back(self.branch_parent(compaction_position)) {
+            let entry = &self.entries[position];
+            if entry.id == first_kept {
+                return count + usize::from(entry_bears_message(entry));
+            }
+            count += usize::from(entry_bears_message(entry));
+        }
+        0
     }
 
     /// The position of page anchor `id`: a display row on the active branch.
@@ -866,6 +874,19 @@ fn entry_message(entry: &SessionEntry) -> Option<std::borrow::Cow<'_, Value>> {
             }
             Some(std::borrow::Cow::Owned(message))
         }
+        "branch_summary" => {
+            let summary = entry
+                .fields
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|summary| !summary.is_empty())?;
+            Some(std::borrow::Cow::Owned(json!({
+                "role": "branchSummary",
+                "summary": summary,
+                "fromId": entry.fields.get("fromId").cloned().unwrap_or_default(),
+                "timestamp": crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0),
+            })))
+        }
         _ => None,
     }
 }
@@ -950,12 +971,17 @@ fn entry_bears_message(entry: &SessionEntry) -> bool {
     match entry.type_.as_str() {
         "message" => entry.fields.get("message").is_some(),
         "custom_message" => true,
+        "branch_summary" => entry
+            .fields
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| !summary.is_empty()),
         _ => false,
     }
 }
 
-/// The `compactionSummary` message of a compaction entry; the context walk's
-/// copy carries its retained count.
+/// The `compactionSummary` message of a compaction entry; the context walk and
+/// the paged display both carry its retained count.
 fn compaction_summary_message(entry: &SessionEntry, retained_count: Option<usize>) -> Value {
     let timestamp = crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0);
     // The TS `compactionSummary` key order: role, summary, tokensBefore,
