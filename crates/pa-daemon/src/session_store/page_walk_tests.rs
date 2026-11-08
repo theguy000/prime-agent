@@ -407,8 +407,9 @@ fn reference_messages(
     let rows: Vec<(String, Value)> = reference_branch(store)
         .into_iter()
         .filter_map(|entry| {
+            let position = *store.by_id.get(&entry.id)?;
             let message = if entry.type_ == "compaction" {
-                compaction_summary_message(entry, None)
+                compaction_summary_message(entry, Some(store.retained_message_count(position)))
             } else {
                 entry_message(entry)?.into_owned()
             };
