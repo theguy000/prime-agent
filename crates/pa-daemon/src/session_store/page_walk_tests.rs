@@ -172,8 +172,12 @@ fn reference_page(store: &SessionFile, page: &TranscriptPage) -> Option<PageView
     let mut rows: Vec<DisplayRow<'_>> = reference_branch(store)
         .into_iter()
         .filter_map(|entry| {
+            let position = *store.by_id.get(&entry.id)?;
             let message = if entry.type_ == "compaction" {
-                std::borrow::Cow::Owned(compaction_summary_message(entry, None))
+                std::borrow::Cow::Owned(compaction_summary_message(
+                    entry,
+                    Some(store.retained_message_count(position)),
+                ))
             } else {
                 entry_message(entry)?
             };
@@ -215,14 +219,17 @@ fn reference_page(store: &SessionFile, page: &TranscriptPage) -> Option<PageView
         }
     };
     rows.truncate(end);
-    let page_rows = rows.split_off(start);
+    let mut page_rows = rows.split_off(start);
+    let first_entry_id = page_rows.first().map(|(id, _)| (*id).to_string());
+    let last_entry_id = page_rows.last().map(|(id, _)| (*id).to_string());
+    store.move_compaction_summary(&mut page_rows);
     Some((
         page_rows
             .iter()
             .map(|(_, message)| message.clone().into_owned())
             .collect(),
-        page_rows.first().map(|(id, _)| (*id).to_string()),
-        page_rows.last().map(|(id, _)| (*id).to_string()),
+        first_entry_id,
+        last_entry_id,
         more,
     ))
 }
@@ -604,4 +611,100 @@ fn a_windowed_store_counts_its_prefix_and_reads_its_window() {
         );
         assert_eq!(messages_of(&mut windowed, 0, 5, roles), None, "{roles:?}");
     }
+}
+
+#[test]
+fn a_paged_compaction_summary_precedes_its_retained_window() {
+    let mut store = SessionFile::create("/tmp", None, 0);
+    store.append_message(&user("before the cut"));
+    let retained = store.append_message(&user("retained"));
+    store.append_message(&assistant("retained reply"));
+    store.append_entry(
+        "compaction",
+        json!({ "summary": "the story", "firstKeptEntryId": retained, "tokensBefore": 12 }),
+    );
+    store.append_message(&assistant("after"));
+
+    let page = store
+        .transcript_page(&TranscriptPage::End {
+            before: None,
+            limit: 20,
+        })
+        .unwrap();
+    let summary_index = page
+        .messages
+        .iter()
+        .position(|message| message_role(message) == Some("compactionSummary"))
+        .unwrap();
+    let retained_index = page
+        .messages
+        .iter()
+        .position(|message| message_text(message) == "retained")
+        .unwrap();
+    assert!(
+        summary_index < retained_index,
+        "the summary must precede its retained window"
+    );
+    assert_eq!(
+        page.messages[summary_index]["retainedMessageCount"],
+        json!(2)
+    );
+    assert_eq!(page.messages.len(), 5);
+
+    let start = store
+        .transcript_page(&TranscriptPage::Start {
+            after: None,
+            until: None,
+            limit: 20,
+        })
+        .unwrap();
+    let summary_index = start
+        .messages
+        .iter()
+        .position(|message| message_role(message) == Some("compactionSummary"))
+        .unwrap();
+    let retained_index = start
+        .messages
+        .iter()
+        .position(|message| message_text(message) == "retained")
+        .unwrap();
+    assert!(
+        summary_index < retained_index,
+        "start pages keep the same summary order"
+    );
+}
+
+#[test]
+fn a_paged_branch_summary_keeps_its_body_and_source() {
+    let mut store = SessionFile::create("/tmp", None, 0);
+    let before = store.append_message(&user("before"));
+    let summary = store.append_entry(
+        "branch_summary",
+        json!({ "fromId": before, "summary": "**Branch**\nexplored", "details": null }),
+    );
+    store.append_message(&assistant("after"));
+
+    let page = store
+        .transcript_page(&TranscriptPage::End {
+            before: None,
+            limit: 20,
+        })
+        .unwrap();
+    let row = page
+        .messages
+        .iter()
+        .find(|message| message_role(message) == Some("branchSummary"))
+        .expect("the branch summary row");
+    assert_eq!(row["summary"], json!("**Branch**\nexplored"));
+    assert_eq!(row["fromId"], json!(before));
+    assert!(store.branch_contains(&summary));
+
+    let messages = store.messages();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message_role(message) == Some("branchSummary"))
+            .count(),
+        1
+    );
 }

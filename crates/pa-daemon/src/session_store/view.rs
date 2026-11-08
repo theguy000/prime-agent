@@ -464,11 +464,33 @@ impl SessionFile {
     fn display_row(&self, position: usize) -> Option<DisplayRow<'_>> {
         let entry = &self.entries[position];
         let message = if entry.type_ == "compaction" {
-            std::borrow::Cow::Owned(compaction_summary_message(entry, None))
+            std::borrow::Cow::Owned(compaction_summary_message(
+                entry,
+                Some(self.retained_message_count(position)),
+            ))
         } else {
             entry_message(entry)?
         };
         Some((entry.id.as_str(), message))
+    }
+
+    /// Message-bearing rows from a compaction's `firstKeptEntryId` through its parent.
+    fn retained_message_count(&self, compaction_position: usize) -> usize {
+        let compaction = &self.entries[compaction_position];
+        let first_kept = compaction
+            .fields
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut count = 0usize;
+        for position in self.walk_back(self.branch_parent(compaction_position)) {
+            let entry = &self.entries[position];
+            if entry.id == first_kept {
+                return count + usize::from(entry_bears_message(entry));
+            }
+            count += usize::from(entry_bears_message(entry));
+        }
+        0
     }
 
     /// The position of page anchor `id`: a display row on the active branch.
@@ -483,7 +505,7 @@ impl SessionFile {
     /// The page walks from its anchor, so its cost follows the page, not the session.
     #[must_use]
     pub fn transcript_page(&self, page: &TranscriptPage) -> Option<TranscriptPageRows> {
-        let (rows, more) = match page {
+        let (mut rows, more) = match page {
             TranscriptPage::End { before, limit } => self.end_page(before.as_deref(), *limit)?,
             TranscriptPage::Start {
                 after,
@@ -491,15 +513,58 @@ impl SessionFile {
                 limit,
             } => self.start_page(after.as_deref(), until.as_deref(), *limit)?,
         };
+        // The summary is not a page cursor: the original first row keeps an older request
+        // from fetching the retained window again.
+        let first_entry_id = rows.first().map(|(id, _)| (*id).to_string());
+        let last_entry_id = rows.last().map(|(id, _)| (*id).to_string());
+        self.move_compaction_summary(&mut rows);
         Some(TranscriptPageRows {
-            first_entry_id: rows.first().map(|(id, _)| (*id).to_string()),
-            last_entry_id: rows.last().map(|(id, _)| (*id).to_string()),
+            first_entry_id,
+            last_entry_id,
             messages: rows
                 .into_iter()
                 .map(|(_, message)| message.into_owned())
                 .collect(),
             more,
         })
+    }
+
+    /// Put a compaction summary before the retained window it describes.
+    ///
+    /// The compaction entry sits after its retained rows in the file. The page keeps its
+    /// original row ids, so the summary can move without changing the paging cursor.
+    fn move_compaction_summary(&self, rows: &mut Vec<DisplayRow<'_>>) {
+        let Some(summary_index) = rows
+            .iter()
+            .position(|(_, message)| message_role(message) == Some("compactionSummary"))
+        else {
+            return;
+        };
+        let summary_id = rows[summary_index].0;
+        let Some(compaction) = self.entry(summary_id) else {
+            return;
+        };
+        let first_kept = compaction
+            .fields
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(cut_position) = self.by_id.get(first_kept).copied() else {
+            return;
+        };
+        let Some(target) = rows.iter().enumerate().find_map(|(index, (id, _))| {
+            if index == summary_index {
+                return None;
+            }
+            let position = *self.by_id.get(*id)?;
+            (position >= cut_position).then_some(index)
+        }) else {
+            return;
+        };
+        if target < summary_index {
+            let summary = rows.remove(summary_index);
+            rows.insert(target, summary);
+        }
     }
 
     /// The newest `limit` rows before the `before` row (the tail without it).
@@ -866,6 +931,19 @@ fn entry_message(entry: &SessionEntry) -> Option<std::borrow::Cow<'_, Value>> {
             }
             Some(std::borrow::Cow::Owned(message))
         }
+        "branch_summary" => {
+            let summary = entry
+                .fields
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|summary| !summary.is_empty())?;
+            Some(std::borrow::Cow::Owned(json!({
+                "role": "branchSummary",
+                "summary": summary,
+                "fromId": entry.fields.get("fromId").cloned().unwrap_or_default(),
+                "timestamp": crate::util::iso_to_unix_ms(&entry.timestamp).unwrap_or(0),
+            })))
+        }
         _ => None,
     }
 }
@@ -950,6 +1028,11 @@ fn entry_bears_message(entry: &SessionEntry) -> bool {
     match entry.type_.as_str() {
         "message" => entry.fields.get("message").is_some(),
         "custom_message" => true,
+        "branch_summary" => entry
+            .fields
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| !summary.is_empty()),
         _ => false,
     }
 }

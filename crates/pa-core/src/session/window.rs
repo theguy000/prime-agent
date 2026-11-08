@@ -148,6 +148,7 @@ pub fn display_role<'a>(entry_type: &str, message_role: Option<&'a str>) -> Opti
         "message" => message_role,
         "custom_message" => Some("custom"),
         "compaction" => Some("compactionSummary"),
+        "branch_summary" => Some("branchSummary"),
         _ => None,
     }
 }
