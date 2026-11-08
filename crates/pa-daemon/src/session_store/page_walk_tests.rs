@@ -612,6 +612,35 @@ fn a_windowed_store_counts_its_prefix_and_reads_its_window() {
 }
 
 #[test]
+fn retained_count_uses_the_compaction_file_position() {
+    let mut store = SessionFile::create("/tmp", None, 0);
+    let first = store.append_message(&user("first"));
+    store.append_message(&user("abandoned"));
+    store.branch_to(Some(&first)).unwrap();
+    let retained = store.append_message(&user("retained one"));
+    store.append_message(&assistant("retained reply"));
+    store.append_entry(
+        "compaction",
+        json!({ "summary": "the story", "firstKeptEntryId": retained, "tokensBefore": 12 }),
+    );
+
+    let messages = store.messages();
+    assert_eq!(messages[0]["retainedMessageCount"], json!(2));
+    let page = store
+        .transcript_page(&TranscriptPage::End {
+            before: None,
+            limit: 20,
+        })
+        .unwrap();
+    let summary = page
+        .messages
+        .iter()
+        .find(|message| message_role(message) == Some("compactionSummary"))
+        .expect("the summary row");
+    assert_eq!(summary["retainedMessageCount"], json!(2));
+}
+
+#[test]
 fn a_paged_compaction_summary_carries_its_retained_count() {
     let mut store = SessionFile::create("/tmp", None, 0);
     store.append_message(&user("before the cut"));

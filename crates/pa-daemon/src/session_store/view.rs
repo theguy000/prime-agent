@@ -417,7 +417,7 @@ impl SessionFile {
             .unwrap_or_default();
         let summary = std::borrow::Cow::Owned(compaction_summary_message(
             compaction,
-            Some(self.retained_message_count(compaction_position)),
+            Some(self.retained_message_count(self.by_id[compaction.id.as_str()])),
         ));
         if !visit(summary) {
             return;
